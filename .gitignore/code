@@ -1,0 +1,271 @@
+import pandas as pd
+import numpy as np
+from pymongo import MongoClient
+import re
+import time
+import xlsxwriter
+import sys
+import warnings
+import os
+if not sys.warnoptions:
+    warnings.simplefilter("ignore")
+
+str_day = input("Enter number of days to pull data: ")
+day_window=int(str_day)
+#Setting Time Range
+current=int(round(time.time() * 1000))
+back=current-(day_window*7*24*60*60*1000)
+
+print("Querying MongoDB, this may take a while")
+#Connection settings for MongoDB remote
+uri='mongodb://app:ENTER ID' #you must enter in your own ID at this point
+client = MongoClient(uri)
+db = client.twitterdb #change your database name    
+collection = db.twitter_search #change your collection name
+
+#where the data gets actually pulled
+datafull = pd.DataFrame(list(collection.find({"timestamp_ms" : {
+        "$gte": "%f" % back,
+        "$lt": "%f" % current
+        }})))
+
+print("Query Complete")
+print("Weekly view saved here:",os.getcwd())
+#keeping important columns
+datafull=datafull[['created_at','favorite_count','favorited','id_str','lang','reply_count','retweet_count','text','user']]
+
+#will need to change to their working directory
+#os.chdir('~\')
+
+#---------------------------- filtering data for most recent time range
+#creating a date column
+datafull['date'] = pd.to_datetime(datafull['created_at'])
+
+#selecting the lookup timeframe
+days=day_window
+cutoff_date = datafull['date'].iloc[-1] - pd.Timedelta(days=days)
+
+#filtering the db on the time
+dftime = datafull[datafull['date'] > cutoff_date] 
+
+#---------------------------- initial cleaning
+#filtering on english language
+enlang=dftime['lang'].str.contains('en')
+dftime=dftime[enlang]
+
+#Removing retweets from the data
+retweet=dftime['text'].str.contains('RT @')    
+dftime=dftime[-retweet]
+
+#Sorting on data: created_at
+dftime=dftime.sort_values(by='date')
+
+#Extracting link from Tweets in a seperate column
+def extract_link(text):
+    regex = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+    match = re.search(regex, text)
+    if match:
+        return match.group()
+    return ''
+
+dftime['link'] = dftime['text'].apply(lambda tweet: extract_link(tweet))
+
+#Removing links from tweet text
+dftime['text'] = dftime['text'] .replace(r'http\S+', '', regex=True).replace(r'www\S+', '', regex=True)
+
+#Removing duplicate tweets
+dftime=dftime.drop_duplicates(['text'],keep='first')
+dftime.head(5)
+
+#adding quotes to id_str
+dftime['tweet_id_str']="\""+dftime['id_str']+"\""
+
+#---------------------------- user db
+#Breaking user data into columns to prepare for users df
+extract=dftime['user'].apply(pd.Series)
+extract2 = extract[['screen_name']]
+
+#adding in screenname to dftime db
+dftime=pd.concat([dftime,extract2],axis=1)
+
+
+#Keeping desired columns in dataframe
+userdb=extract[['id_str','screen_name','followers_count','friends_count','listed_count','verified']]
+
+#user ID parsing 
+userdb.columns.values[0] = 'User_ID'
+userdb['User_ID']="\""+userdb['User_ID']+"\""
+
+#Removing duplicate users
+userdb=userdb.drop_duplicates(['screen_name'],keep='first')
+
+#---------------------------- removing emoticons and punctuations
+#Remove emoticons
+def remove_emoji(string):
+    emoji_pattern = re.compile("["
+                           u"\U0001F600-\U0001F64F"  # emoticons
+                           u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+                           u"\U0001F680-\U0001F6FF"  # transport & map symbols
+                           u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                           u"\U00002702-\U000027B0"
+                           u"\U000024C2-\U0001F251"
+                           "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', string)
+
+dftime['clean_text']=""
+
+for index, row in dftime.iterrows():
+    dftime.loc[index, 'clean_text']=remove_emoji(row['text'])
+
+#extracting hashtags
+def extract_hash_tags(s):
+    return set(part[1:] for part in s.split() if part.startswith('#'))
+
+dftime['hashtag'] = dftime['text'].apply(lambda tweet: extract_hash_tags(tweet))
+
+#extracting tagged users
+def extract_tagged_users(s):
+    return set(part[1:] for part in s.split() if part.startswith('@'))
+
+dftime['tagged_users'] = dftime['text'].apply(lambda tweet: extract_tagged_users(tweet))
+dftime['tagged_users'].head
+
+#Removing punctions 
+import string
+def remove_punctuations(text):
+    for punctuation in string.punctuation:
+        text = text.replace(punctuation, '')
+    return text
+dftime['clean_text'] = dftime['clean_text'].apply(remove_punctuations)
+
+#removing tagged users & remaining special characters
+def clean_tweet(tweet):
+    '''
+    Utility function to clean the text in a tweet by removing 
+    links and special characters using regex.
+    '''
+    return ' '.join(re.sub("(@[A-Za-z0-9]+)|([^0-9A-Za-z \t])|(\w+:\/\/\S+)", "", tweet).split())
+
+for index, row in dftime.iterrows():
+    dftime.loc[index, 'clean_text']=clean_tweet(row['text'])
+
+#---------------------------- stop word and tokenizing
+#Remove Stopwords from Tweet text and tokenizing
+dftime['text_tokenize'] = ""
+dftime['text_tokenize'] = dftime['clean_text'].str.lower().str.split()
+from nltk.corpus import stopwords
+stop = stopwords.words('english')
+dftime['text_tokenize'] = dftime['text_tokenize'].apply(lambda x: [item for item in x if item not in stop])
+
+
+#Stemming
+from nltk.stem import SnowballStemmer
+stemmer = SnowballStemmer('english')
+dftime['stemmed'] = dftime['text_tokenize'].apply(lambda x: [stemmer.stem(y) for y in x])
+
+#Joining the words
+dftime['stemmedjoin'] = dftime['stemmed'].apply(lambda x: ' '.join([word for word in x if word not in (stop)]))
+dftime["stemmedjoin"].head(2)
+
+
+#---------------------------- sentiment classification
+#using textblob for sentiment
+from textblob import TextBlob
+def analyze_sentiment(tweet):
+    '''
+    Utility function to classify the polarity of a tweet
+    using textblob.
+    '''
+    analysis = TextBlob(clean_tweet(tweet))
+    if analysis.sentiment.polarity > 0.5:
+        return 1
+    elif analysis.sentiment.polarity < -0.5:
+        return -1
+    else:
+        return 0
+# Create a column with the result of the analysis:
+dftime['Sentiment'] = np.array([ analyze_sentiment(tweet) for tweet in dftime['clean_text']])
+
+#---------------------------- top and bottom performing
+from sklearn.feature_extraction.text import CountVectorizer
+word_vectorizer = CountVectorizer(ngram_range=(2,3), analyzer='word')
+
+#### positive
+posdta = dftime[dftime['Sentiment']==1]
+sparse_matrixpos = word_vectorizer.fit_transform(posdta['stemmedjoin'])
+frequenciespos = sum(sparse_matrixpos).toarray()[0]
+poslist = pd.DataFrame(frequenciespos, index=word_vectorizer.get_feature_names(), columns=['frequency'])
+topten=poslist.sort_values(by=['frequency'], ascending=False).head(10)
+
+
+#### negative
+negdta = dftime[dftime['Sentiment']==-1]
+sparse_matrixneg = word_vectorizer.fit_transform(negdta['stemmedjoin'])
+frequenciesneg = sum(sparse_matrixneg).toarray()[0]
+neglist = pd.DataFrame(frequenciesneg, index=word_vectorizer.get_feature_names(), columns=['frequency'])
+bottomten=neglist.sort_values(by=['frequency'], ascending=False).head(10)
+
+
+#---------------------------- trended views
+#stripping out date and time
+d = pd.to_datetime(dftime['date'], format='%d-%b-%y %H.%M.%S')
+dftime['time'] = d.dt.time
+dftime['date'] = d.dt.date
+
+#plotting sentiment over time
+sentovertime = dftime.groupby(['date', 'Sentiment']).count()['text'].unstack()
+sentovertime.columns = ['Negative', 'Neutral', 'Positive']
+sentovertime.plot(kind='line')
+
+#---------------------------- hashtag & user frequency 
+from nltk.probability import FreqDist
+#hashtag frequency
+hashtags = []
+dftime['hashtagjoin'] = dftime['hashtag'].apply(lambda x: ' '.join([word for word in x]))
+dftime['hashtagjoin'].str.len()
+for hs in dftime['hashtagjoin']: # Each entry may contain multiple hashtags. Split.
+       hashtags += hs.split(" ")
+fdist1 = FreqDist(list(filter(lambda x:  x != '',hashtags)))
+rslthshtg=pd.DataFrame(fdist1.most_common(10),columns=['Hashtag','Frequency'])
+
+#user frequency
+usersfreq = dftime["screen_name"].tolist()
+fdist2 = FreqDist(usersfreq)
+rsltuser=pd.DataFrame(fdist2.most_common(10),columns=['Screen_Name','Frequency'])
+
+#tagged users frequency
+tagged_users = []
+dftime['tagged_usersjoin'] = dftime['tagged_users'].apply(lambda x: ' '.join([word for word in x]))
+dftime['tagged_usersjoin'].str.len()
+for hs in dftime['tagged_usersjoin']: # Each entry may contain multiple hashtags. Split.
+       tagged_users += hs.split(" ")
+fdist3 = FreqDist(list(filter(lambda x:  x != '',tagged_users)))
+rslttggdusr=pd.DataFrame(fdist3.most_common(10),columns=['Hashtag','Frequency'])
+#---------------------------- csv output
+# Create a Pandas Excel writer using XlsxWriter as the engine.
+writer = pd.ExcelWriter('weekly_view.xlsx', engine='xlsxwriter')
+
+# Write each dataframe to a different worksheet.
+topten.to_excel(writer, sheet_name='Top_Positive_10')
+bottomten.to_excel(writer, sheet_name='Bottom_Negative_10')
+sentovertime.to_excel(writer, sheet_name='Weekly_All')
+rslthshtg.to_excel(writer,sheet_name='Popular_Hashtags')
+rsltuser.to_excel(writer,sheet_name='Top_Users')
+rslttggdusr.to_excel(writer,sheet_name='Top_Tagged_Users')
+
+workbook = writer.book
+worksheet = writer.sheets['Weekly_All']
+chart = workbook.add_chart({'type': 'column'})
+chart.add_series({'categories': '=Weekly_All!$A$2:$A$8',
+                  'name':'=Weekly_All!$B$1:$B$1',
+                  'values': '=Weekly_All!$B$2:$B$8'})
+chart.add_series({'categories': '=Weekly_All!$A$2:$A$8',
+                  'name':'=Weekly_All!$C$1:$C$1',
+                  'values': '=Weekly_All!$C$2:$C$8'})
+chart.add_series({'categories': '=Weekly_All!$A$2:$A$8',
+                  'name':'=Weekly_All!$D$1:$D$1',
+                  'values': '=Weekly_All!$D$2:$D$8'})
+
+    
+# Close the Pandas Excel writer and output the Excel file.
+writer.save()
